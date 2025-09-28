@@ -59,14 +59,24 @@ type MonitorConfig struct {
 func NewDirectoryMonitor(config MonitorConfig) *DirectoryMonitor {
 	timestamp := time.Now().Format("20060102_150405")
 
+	watchDirAbs, err := filepath.Abs(config.WatchDir)
+	if err != nil {
+		log.Fatalf("获取监控目录绝对路径失败: %v", err)
+	}
+
+	baseDirAbs, err := filepath.Abs(config.BaseDir)
+	if err != nil {
+		log.Fatalf("获取基础目录绝对路径失败: %v", err)
+	}
+
 	return &DirectoryMonitor{
-		watchDir:      config.WatchDir,
-		baseDir:       config.BaseDir,
+		watchDir:      watchDirAbs,
+		baseDir:       baseDirAbs,
 		backupDir:     filepath.Join(config.BaseDir, fmt.Sprintf("backup_%s", timestamp)),
 		isolateDir:    filepath.Join(config.BaseDir, fmt.Sprintf("isolate_%s", timestamp)),
 		extensions:    config.Extensions,
 		baseline:      make(map[string]FileInfo),
-		checkInterval: 200 * time.Millisecond, // 硬编码为200ms，快速响应
+		checkInterval: 200 * time.Millisecond, // 硬编码为200ms,快速响应
 		apiEndpoint:   config.APIEndpoint,
 	}
 }
@@ -95,6 +105,7 @@ func logDebug(msg string) {
 	log.Printf("%s[DEBUG]%s %s", ColorCyan, ColorReset, msg)
 }
 
+// 发送到API告警, 你完全可以自己修改并实现. python这个还是比较灵车的
 func (dm *DirectoryMonitor) sendAPIAlert(alertType, message string) {
 	if dm.apiEndpoint == "" {
 		return
@@ -118,6 +129,7 @@ func (dm *DirectoryMonitor) sendAPIAlert(alertType, message string) {
 	}
 }
 
+// 对于指定后缀的情况, 判断文件是否为指定后缀
 func (dm *DirectoryMonitor) shouldMonitorFile(filename string) bool {
 	if len(dm.extensions) == 0 {
 		return true
@@ -132,8 +144,9 @@ func (dm *DirectoryMonitor) shouldMonitorFile(filename string) bool {
 	return false
 }
 
+// 用于判断是不是"文件", 排除掉链接, 设备等. 使用Lstat不跟随符号链接
 func (dm *DirectoryMonitor) isRegularFile(filePath string) bool {
-	info, err := os.Lstat(filePath) // 使用Lstat不跟随符号链接
+	info, err := os.Lstat(filePath)
 	if err != nil {
 		return false
 	}
@@ -141,6 +154,8 @@ func (dm *DirectoryMonitor) isRegularFile(filePath string) bool {
 	return info.Mode().IsRegular()
 }
 
+// 获取文件信息, 只使用lstat即可, 不需要完整的读取文件, 因为一般来说
+// 写马都是多少会改动文件大小或者时间戳或追加到文件, 不可能完美修改
 func (dm *DirectoryMonitor) getFileInfo(filePath string) (FileInfo, error) {
 	info, err := os.Stat(filePath)
 	if err != nil {
@@ -176,7 +191,6 @@ func (dm *DirectoryMonitor) validatePaths() error {
 			watchAbs, baseAbs)
 	}
 
-	logSuccess("路径验证通过")
 	logInfo(fmt.Sprintf("监控目录: %s", watchAbs))
 	logInfo(fmt.Sprintf("备份目录: %s", dm.backupDir))
 	logInfo(fmt.Sprintf("隔离目录: %s", dm.isolateDir))
@@ -193,7 +207,11 @@ func (dm *DirectoryMonitor) discoverDirectories() error {
 		}
 
 		if info.IsDir() {
-			directories[path] = true
+			absPath, err := filepath.Abs(path)
+			if err != nil {
+				return err
+			}
+			directories[absPath] = true
 		}
 		return nil
 	})
@@ -264,7 +282,7 @@ func (dm *DirectoryMonitor) restoreFileAttributes(filePath string, fileInfo File
 
 	if err := os.Chown(filePath, int(fileInfo.Uid), int(fileInfo.Gid)); err != nil {
 		logDebug(fmt.Sprintf("设置文件所有者失败 %s: %v", filePath, err))
-		// 不返回错误，因为非root用户通常无法修改所有者
+		// 不返回错误, 因为非root用户通常无法修改所有者
 	}
 
 	modTime := time.Unix(fileInfo.ModTime, 0)
@@ -303,7 +321,7 @@ func (dm *DirectoryMonitor) backupAllFiles() error {
 		return err
 	}
 
-	logSuccess(fmt.Sprintf("备份完成，共备份 %d 个文件", fileCount))
+	logSuccess(fmt.Sprintf("备份完成,共备份 %d 个文件", fileCount))
 	return nil
 }
 
@@ -316,12 +334,18 @@ func (dm *DirectoryMonitor) buildBaseline() error {
 		}
 
 		if !info.IsDir() && dm.shouldMonitorFile(path) && dm.isRegularFile(path) {
-			fileInfo, err := dm.getFileInfo(path)
+			absPath, err := filepath.Abs(path)
 			if err != nil {
-				logError(fmt.Sprintf("获取文件信息失败 %s: %v", path, err))
+				logError(fmt.Sprintf("获取文件绝对路径失败 %s: %v", path, err))
 				return err
 			}
-			baseline[path] = fileInfo
+
+			fileInfo, err := dm.getFileInfo(absPath)
+			if err != nil {
+				logError(fmt.Sprintf("获取文件信息失败 %s: %v", absPath, err))
+				return err
+			}
+			baseline[absPath] = fileInfo
 		}
 		return nil
 	})
@@ -334,7 +358,7 @@ func (dm *DirectoryMonitor) buildBaseline() error {
 	dm.baseline = baseline
 	dm.mu.Unlock()
 
-	logSuccess(fmt.Sprintf("基线建立完成，共 %d 个文件", len(baseline)))
+	logSuccess(fmt.Sprintf("基线建立完成,共 %d 个文件", len(baseline)))
 	return nil
 }
 
@@ -383,7 +407,6 @@ func (dm *DirectoryMonitor) restoreFile(filePath string) error {
 }
 
 func (dm *DirectoryMonitor) isolateFile(filePath string) error {
-	// 创建隔离目录
 	if err := os.MkdirAll(dm.isolateDir, 0755); err != nil {
 		return fmt.Errorf("创建隔离目录失败: %v", err)
 	}
@@ -405,6 +428,20 @@ func (dm *DirectoryMonitor) isolateFile(filePath string) error {
 }
 
 func (dm *DirectoryMonitor) getDirectChildren(dirPath string) ([]string, error) {
+	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+		logAlert(fmt.Sprintf("检测到目录被删除: %s", dirPath))
+		dm.sendAPIAlert("critical", fmt.Sprintf("检测到目录被删除: %s", dirPath))
+
+		logInfo(fmt.Sprintf("正在重新创建目录: %s", dirPath))
+		if err := os.MkdirAll(dirPath, 0755); err != nil {
+			return nil, fmt.Errorf("重新创建目录失败 %s: %v", dirPath, err)
+		}
+
+		logSuccess(fmt.Sprintf("目录已重新创建: %s", dirPath))
+		// 返回空的文件列表,后续的逻辑会处理文件恢复
+		return []string{}, nil
+	}
+
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
 		return nil, err
@@ -414,8 +451,14 @@ func (dm *DirectoryMonitor) getDirectChildren(dirPath string) ([]string, error) 
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			fullPath := filepath.Join(dirPath, entry.Name())
-			if dm.shouldMonitorFile(fullPath) && dm.isRegularFile(fullPath) {
-				files = append(files, fullPath)
+			absPath, err := filepath.Abs(fullPath)
+			if err != nil {
+				logError(fmt.Sprintf("获取文件绝对路径失败 %s: %v", fullPath, err))
+				continue
+			}
+
+			if dm.shouldMonitorFile(absPath) && dm.isRegularFile(absPath) {
+				files = append(files, absPath)
 			}
 		}
 	}
@@ -438,6 +481,13 @@ func (dm *DirectoryMonitor) monitorDirectory(dirPath string, wg *sync.WaitGroup)
 }
 
 func (dm *DirectoryMonitor) checkDirectoryChanges(dirPath string) {
+	absDirPath, err := filepath.Abs(dirPath)
+	if err != nil {
+		logError(fmt.Sprintf("获取目录绝对路径失败 %s: %v", dirPath, err))
+		return
+	}
+	cleanDirPath := filepath.Clean(absDirPath)
+
 	currentFiles, err := dm.getDirectChildren(dirPath)
 	if err != nil {
 		logError(fmt.Sprintf("读取目录失败 %s: %v", dirPath, err))
@@ -463,9 +513,7 @@ func (dm *DirectoryMonitor) checkDirectoryChanges(dirPath string) {
 			alertMsg := fmt.Sprintf("检测到新增可疑文件: %s (大小: %d bytes)",
 				filepath.Base(filePath), currentInfo.Size)
 			logAlert(alertMsg)
-
 			dm.sendAPIAlert("warning", alertMsg)
-
 			if err := dm.isolateFile(filePath); err != nil {
 				logError(fmt.Sprintf("隔离新增文件失败: %v", err))
 			}
@@ -473,21 +521,16 @@ func (dm *DirectoryMonitor) checkDirectoryChanges(dirPath string) {
 			if currentInfo.Size != baselineInfo.Size ||
 				currentInfo.ModTime != baselineInfo.ModTime ||
 				currentInfo.Mode != baselineInfo.Mode {
-
 				alertMsg := fmt.Sprintf("检测到文件被修改: %s", filepath.Base(filePath))
 				logAlert(alertMsg)
-
 				dm.sendAPIAlert("warning", alertMsg)
-
 				logInfo(fmt.Sprintf("修改详情 - 原始: 大小=%d, 时间=%d, 权限=%v",
 					baselineInfo.Size, baselineInfo.ModTime, baselineInfo.Mode))
 				logInfo(fmt.Sprintf("修改详情 - 当前: 大小=%d, 时间=%d, 权限=%v",
 					currentInfo.Size, currentInfo.ModTime, currentInfo.Mode))
-
 				if err := dm.isolateFile(filePath); err != nil {
 					logError(fmt.Sprintf("隔离被修改文件失败: %v", err))
 				}
-
 				if err := dm.restoreFile(filePath); err != nil {
 					logError(fmt.Sprintf("还原文件失败: %v", err))
 				}
@@ -496,13 +539,13 @@ func (dm *DirectoryMonitor) checkDirectoryChanges(dirPath string) {
 	}
 
 	for filePath := range baseline {
-		if filepath.Dir(filePath) == dirPath {
+		fileDir := filepath.Clean(filepath.Dir(filePath))
+
+		if fileDir == cleanDirPath {
 			if _, exists := currentFileMap[filePath]; !exists {
 				alertMsg := fmt.Sprintf("检测到文件被删除: %s", filepath.Base(filePath))
 				logAlert(alertMsg)
-
 				dm.sendAPIAlert("warning", alertMsg)
-
 				if err := dm.restoreFile(filePath); err != nil {
 					logError(fmt.Sprintf("还原被删除的文件失败: %v", err))
 				}
@@ -532,7 +575,7 @@ func (dm *DirectoryMonitor) Start() error {
 		return fmt.Errorf("创建隔离目录失败: %v", err)
 	}
 
-	logInfo(fmt.Sprintf("启动 %d 个监控goroutine，检测间隔: %v",
+	logInfo(fmt.Sprintf("启动 %d 个监控goroutine,检测间隔: %v",
 		len(dm.directories), dm.checkInterval))
 
 	if dm.apiEndpoint != "" {
@@ -547,7 +590,7 @@ func (dm *DirectoryMonitor) Start() error {
 		go dm.monitorDirectory(dir, &wg)
 	}
 
-	logSuccess("EDR监控已启动，正在监控文件变化...")
+	logSuccess("EDR监控已启动,正在监控文件变化...")
 	wg.Wait()
 
 	return nil
@@ -577,8 +620,8 @@ func parseExtensions(extStr string) []string {
 func main() {
 	var (
 		monitorDir  = flag.String("m", "", "监控目录路径 (必需)")
-		baseDir     = flag.String("b", "", "基础目录路径，将在此目录下创建backup_和isolate_子目录 (必需)")
-		extensions  = flag.String("e", "", "监控的文件扩展名，用逗号分隔 (例如: .php,.js,.html)")
+		baseDir     = flag.String("b", "", "基础目录路径,将在此目录下创建backup_和isolate_子目录 (必需)")
+		extensions  = flag.String("e", "", "监控的文件扩展名,用逗号分隔 (例如: .php,.js,.html)")
 		apiEndpoint = flag.String("a", "", "API端点地址 (例如: 192.168.1.100:8080), 不指定则不发送")
 		help        = flag.Bool("h", false, "显示帮助信息")
 	)
