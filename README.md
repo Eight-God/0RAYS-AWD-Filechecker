@@ -6,7 +6,7 @@
 
 由于使用的Linux的系统调用, 仅支持Linux环境使用.
 
-![description](img/photo1.jpg)
+![description](img/photo1.png)
 
 ### 工作流程
 
