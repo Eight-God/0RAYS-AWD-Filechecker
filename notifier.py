@@ -41,6 +41,7 @@ class EDRNotifier:
     def __init__(self, sound_enabled=True, log_to_file=True):
         self.sound_enabled = sound_enabled
         self.alert_count = 0
+        self.lock = threading.Lock()
         self.system = platform.system()
         logger.info(f"EDR告警提醒器启动 - 系统: {self.system}")
         
@@ -201,7 +202,8 @@ class EDRAlertHandler(BaseHTTPRequestHandler):
     
     def _process_alert(self, alert_type, message):
         """处理告警逻辑"""
-        self.notifier.alert_count += 1
+        with self.notifier.lock:
+            self.notifier.alert_count += 1
         
         # 记录告警
         logger.warning(f"EDR告警 #{self.notifier.alert_count}: [{alert_type.upper()}] {message}")
