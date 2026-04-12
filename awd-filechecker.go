@@ -72,8 +72,8 @@ func NewDirectoryMonitor(config MonitorConfig) *DirectoryMonitor {
 	return &DirectoryMonitor{
 		watchDir:      watchDirAbs,
 		baseDir:       baseDirAbs,
-		backupDir:     filepath.Join(config.BaseDir, fmt.Sprintf("backup_%s", timestamp)),
-		isolateDir:    filepath.Join(config.BaseDir, fmt.Sprintf("isolate_%s", timestamp)),
+		backupDir:     filepath.Join(baseDirAbs, fmt.Sprintf("backup_%s", timestamp)),
+		isolateDir:    filepath.Join(baseDirAbs, fmt.Sprintf("isolate_%s", timestamp)),
 		extensions:    config.Extensions,
 		baseline:      make(map[string]FileInfo),
 		checkInterval: 200 * time.Millisecond, // 硬编码为200ms,快速响应
@@ -157,7 +157,7 @@ func (dm *DirectoryMonitor) isRegularFile(filePath string) bool {
 // 获取文件信息, 只使用lstat即可, 不需要完整的读取文件, 因为一般来说
 // 写马都是多少会改动文件大小或者时间戳或追加到文件, 不可能完美修改
 func (dm *DirectoryMonitor) getFileInfo(filePath string) (FileInfo, error) {
-	info, err := os.Stat(filePath)
+	info, err := os.Lstat(filePath)
 	if err != nil {
 		return FileInfo{}, err
 	}
@@ -480,6 +480,38 @@ func (dm *DirectoryMonitor) monitorDirectory(dirPath string, wg *sync.WaitGroup)
 	}
 }
 
+func (dm *DirectoryMonitor) watchNewDirectories(wg *sync.WaitGroup) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	known := make(map[string]bool)
+	for _, dir := range dm.directories {
+		known[dir] = true
+	}
+
+	for range ticker.C {
+		filepath.Walk(dm.watchDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() {
+				absPath, err := filepath.Abs(path)
+				if err != nil {
+					return nil
+				}
+				if !known[absPath] {
+					known[absPath] = true
+					logAlert(fmt.Sprintf("检测到新增目录: %s", absPath))
+					dm.sendAPIAlert("warning", fmt.Sprintf("检测到新增目录: %s", absPath))
+					wg.Add(1)
+					go dm.monitorDirectory(absPath, wg)
+				}
+			}
+			return nil
+		})
+	}
+}
+
 func (dm *DirectoryMonitor) checkDirectoryChanges(dirPath string) {
 	absDirPath, err := filepath.Abs(dirPath)
 	if err != nil {
@@ -589,6 +621,8 @@ func (dm *DirectoryMonitor) Start() error {
 		wg.Add(1)
 		go dm.monitorDirectory(dir, &wg)
 	}
+
+	go dm.watchNewDirectories(&wg)
 
 	logSuccess("EDR监控已启动,正在监控文件变化...")
 	wg.Wait()
